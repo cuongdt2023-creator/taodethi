@@ -5,73 +5,68 @@ import re
 from docx import Document
 from docxcompose.composer import Composer
 
-# ==================== CẤU HÌNH TRANG ====================
-st.set_page_config(page_title="AIOMT - Gộp Đề Chuẩn", page_icon="🎯", layout="wide")
+# Cấu hình giao diện
+st.set_page_config(page_title="AIOMT - Gộp Đề Chuẩn", layout="wide")
 
-def get_question_difficulty(paragraph_text):
-    """Xác định độ khó của câu hỏi dựa trên tag #NB, #TH..."""
-    t = paragraph_text.upper()
+def get_difficulty(para_text):
+    t = para_text.upper()
     for tag in ["#VDC", "#VD", "#TH", "#NB"]:
         if tag in t: return tag[1:]
     return "NB"
 
-def split_into_parts(doc):
-    """Phân tách tài liệu thành 3 kho lưu trữ Phần 1, 2, 3."""
-    sections = {"P1": [], "P2": [], "P3": []}
-    current_part = "P1"
-    current_question = []
+def parse_docx_to_bank(file_bytes):
+    """Phân loại câu hỏi vào 3 kho P1, P2, P3"""
+    doc = Document(io.BytesIO(file_bytes))
+    bank = {"P1": [], "P2": [], "P3": []}
+    curr_p = "P1"
+    curr_q = []
     
-    # Duyệt qua các thành phần của tài liệu
     for p in doc.paragraphs:
         txt = p.text.upper()
-        if "PHẦN 1" in txt or "PHẦN I" in txt: current_part = "P1"
-        elif "PHẦN 2" in txt or "PHẦN II" in txt: current_part = "P2"
-        elif "PHẦN 3" in txt or "PHẦN III" in txt: current_part = "P3"
+        if "PHẦN 1" in txt: curr_p = "P1"
+        elif "PHẦN 2" in txt: curr_p = "P2"
+        elif "PHẦN 3" in txt: curr_p = "P3"
         
-        # Nhận diện điểm bắt đầu của một câu hỏi mới
         if re.match(r'^Câu\s*\d+', p.text, re.IGNORECASE):
-            if current_question:
-                # Lưu câu hỏi cũ vào kho
-                diff = get_question_difficulty(current_question[0].text)
-                sections[prev_part].append({"content": current_question, "diff": diff})
-            current_question = [p]
-            prev_part = current_part
-        elif current_question:
-            current_question.append(p)
+            if curr_q:
+                diff = get_difficulty(curr_q[0].text)
+                bank[prev_p].append({"paras": curr_q, "diff": diff})
+            curr_q = [p]
+            prev_p = curr_p
+        elif curr_q:
+            curr_q.append(p)
             
-    # Lưu câu hỏi cuối cùng
-    if current_question:
-        diff = get_question_difficulty(current_question[0].text)
-        sections[prev_part].append({"content": current_question, "diff": diff})
-        
-    return sections
+    if curr_q:
+        bank[prev_p].append({"paras": curr_q, "diff": get_difficulty(curr_q[0].text)})
+    return bank
 
-# ==================== GIAO DIỆN ====================
-st.title("🧩 Gộp Đề Tổng Hợp (Fix Lỗi Content)")
+st.title("🧩 Gộp Đề Tổng Hợp - Fix Lỗi Content")
 
-uploaded_files = st.file_uploader("Tải các file chủ đề (.docx)", type="docx", accept_multiple_files=True)
+files = st.file_uploader("Tải các file chủ đề", type="docx", accept_multiple_files=True)
 
-if uploaded_files:
-    if 'bank' not in st.session_state:
-        st.session_state.bank = {}
-        for f in uploaded_files:
-            doc = Document(io.BytesIO(f.read()))
-            st.session_state.bank[f.name] = split_into_parts(doc)
+if files:
+    # Tránh lỗi IndexError bằng cách reset bank khi số lượng file thay đổi
+    if 'bank' not in st.session_state or len(st.session_state.bank) != len(files):
+        st.session_state.bank = {f.name: parse_docx_to_bank(f.read()) for f in files}
 
-    st.subheader("Cấu hình số câu lấy từ mỗi chủ đề")
     configs = {}
-    cols = st.columns(len(uploaded_files))
+    cols = st.columns(len(files))
     for i, fname in enumerate(st.session_state.bank.keys()):
-        with cols[i]:
-            st.info(f"📁 {fname}")
+        with cols[i]: # Fix lỗi IndexError tại dòng 65
+            st.info(f"📂 {fname[:15]}...")
             p1 = st.number_input(f"P1", 0, 50, 0, key=f"p1_{fname}")
             p2 = st.number_input(f"P2", 0, 50, 0, key=f"p2_{fname}")
             p3 = st.number_input(f"P3", 0, 50, 0, key=f"p3_{fname}")
             configs[fname] = {"P1": p1, "P2": p2, "P3": p3}
 
-    if st.button("🚀 TẠO ĐỀ THI TỔNG HỢP", type="primary", use_container_width=True):
-        final_doc = Document() # Tạo file mới
-        composer = Composer(final_doc)
+    if st.button("🚀 TẠO ĐỀ THI TỔNG HỢP", type="primary"):
+        # Tạo file đích dựa trên template của file đầu tiên
+        template_doc = Document(io.BytesIO(files[0].getvalue()))
+        # Xóa hết nội dung cũ trong template
+        for p in template_doc.paragraphs:
+            p._element.getparent().remove(p._element)
+            
+        final_composer = Composer(template_doc)
         
         titles = {
             "P1": "PHẦN I. Câu trắc nghiệm nhiều phương án lựa chọn.",
@@ -79,45 +74,33 @@ if uploaded_files:
             "P3": "PHẦN III. Câu trắc nghiệm trả lời ngắn."
         }
 
-        for part_key in ["P1", "P2", "P3"]:
-            # Lấy danh sách câu hỏi được chọn
-            selected_questions = []
+        for p_key in ["P1", "P2", "P3"]:
+            selected = []
             for fname, cfg in configs.items():
-                num_needed = cfg[part_key]
-                pool = []
-                for diff in ["NB", "TH", "VD", "VDC"]:
-                    pool.extend(st.session_state.bank[fname][part_key][diff])
+                pool = st.session_state.bank[fname][p_key]
+                num = min(cfg[p_key], len(pool))
+                if num > 0:
+                    selected.extend(random.sample(pool, num))
+            
+            if selected:
+                # Thêm tiêu đề phần
+                template_doc.add_paragraph(titles[p_key]).bold = True
+                random.shuffle(selected)
                 
-                if len(pool) >= num_needed:
-                    selected_questions.extend(random.sample(pool, num_needed))
-                else:
-                    selected_questions.extend(pool)
-
-            if selected_questions:
-                # 1. Thêm tiêu đề phần
-                p_title = final_doc.add_paragraph()
-                run = p_title.add_run(titles[part_key])
-                run.bold = True
-                
-                # 2. Trộn thứ tự câu hỏi trong phần
-                random.shuffle(selected_questions)
-                
-                # 3. Chèn nội dung và đánh lại số câu
-                for idx, q_data in enumerate(selected_questions):
-                    for i, para in enumerate(q_data["content"]):
-                        new_p = final_doc.add_paragraph()
-                        # Đánh lại số câu tại dòng đầu tiên
-                        text = para.text
-                        if i == 0:
+                for idx, q_data in enumerate(selected):
+                    # Tạo một doc tạm cho từng câu để dùng Composer
+                    q_doc = Document()
+                    for j, p_origin in enumerate(q_data["paras"]):
+                        new_p = q_doc.add_paragraph()
+                        text = p_origin.text
+                        if j == 0: # Đánh lại số câu và xóa tag
                             text = re.sub(r'^Câu\s*\d+', f"Câu {idx+1}", text, flags=re.IGNORECASE)
                             text = re.sub(r'#(NB|TH|VD|VDC)', '', text)
-                        
                         new_p.text = text
-                        # Copy định dạng (đơn giản)
-                        new_p.style = para.style
+                    
+                    final_composer.append(q_doc)
 
-        # Xuất file
         output = io.BytesIO()
-        final_doc.save(output)
-        st.success("🎉 Đề thi đã được tạo thành công và không còn lỗi cấu trúc!")
-        st.download_button("📥 Tải đề thi tổng hợp", output.getvalue(), "De_Tong_Hop_Final.docx")
+        template_doc.save(output)
+        st.success("🎉 Đã gộp đề thành công!")
+        st.download_button("📥 Tải đề chuẩn", output.getvalue(), "De_Tong_Hop.docx")
