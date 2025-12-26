@@ -1,150 +1,123 @@
 import streamlit as st
-import re
-import random
-import zipfile
 import io
-from xml.dom import minidom
+import random
+import re
+from docx import Document
+from docxcompose.composer import Composer
 
-# ==================== CẤU HÌNH GIAO DIỆN ====================
-st.set_page_config(page_title="AIOMT - Fix Lỗi Gộp Đề", page_icon="🛠️", layout="wide")
+# ==================== CẤU HÌNH TRANG ====================
+st.set_page_config(page_title="AIOMT - Gộp Đề Chuẩn", page_icon="🎯", layout="wide")
 
-W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-
-def get_text(block):
-    """Lấy văn bản thô từ một block XML."""
-    texts = [t.firstChild.nodeValue for t in block.getElementsByTagNameNS(W_NS, "t") if t.firstChild]
-    return "".join(texts).strip()
-
-def detect_difficulty(text):
-    """Nhận diện độ khó từ các tag #NB, #TH..."""
-    t = text.upper()
+def get_question_difficulty(paragraph_text):
+    """Xác định độ khó của câu hỏi dựa trên tag #NB, #TH..."""
+    t = paragraph_text.upper()
     for tag in ["#VDC", "#VD", "#TH", "#NB"]:
         if tag in t: return tag[1:]
     return "NB"
 
-def parse_docx(file_bytes):
-    """Tách câu hỏi và phân loại theo 3 phần chuẩn."""
-    data = {p: {d: [] for d in ["NB", "TH", "VD", "VDC"]} for p in ["P1", "P2", "P3"]}
-    with zipfile.ZipFile(io.BytesIO(file_bytes), 'r') as zin:
-        xml_content = zin.read("word/document.xml").decode('utf-8')
-        dom = minidom.parseString(xml_content)
-        body = dom.getElementsByTagNameNS(W_NS, "body")[0]
-        blocks = [c for c in body.childNodes if c.nodeType == 1 and c.localName in ["p", "tbl"]]
-        
-        curr_p, curr_q = "P1", []
-        prev_p = "P1"
-        for b in blocks:
-            txt = get_text(b).upper()
-            if "PHẦN 1" in txt: curr_p = "P1"
-            elif "PHẦN 2" in txt: curr_p = "P2"
-            elif "PHẦN 3" in txt: curr_p = "P3"
-            
-            if re.match(r'^Câu\s*\d+', get_text(b), re.IGNORECASE):
-                if curr_q:
-                    diff = detect_difficulty(get_text(curr_q[0]))
-                    data[prev_p][diff].append(curr_q)
-                curr_q, prev_p = [b], curr_p
-            elif curr_q:
-                curr_q.append(b)
-        if curr_q:
-            data[prev_p][detect_difficulty(get_text(curr_q[0]))].append(curr_q)
-    return data
-
-def create_heading_paragraph(text, dom):
-    """Tạo Paragraph XML chuẩn cho tiêu đề để tránh lỗi cấu trúc Word."""
-    p = dom.createElementNS(W_NS, "w:p")
-    pPr = dom.createElementNS(W_NS, "w:pPr")
-    rPr = dom.createElementNS(W_NS, "w:rPr")
-    b = dom.createElementNS(W_NS, "w:b")
-    rPr.appendChild(b)
+def split_into_parts(doc):
+    """Phân tách tài liệu thành 3 kho lưu trữ Phần 1, 2, 3."""
+    sections = {"P1": [], "P2": [], "P3": []}
+    current_part = "P1"
+    current_question = []
     
-    r = dom.createElementNS(W_NS, "w:r")
-    r.appendChild(rPr)
-    t = dom.createElementNS(W_NS, "w:t")
-    t.appendChild(dom.createTextNode(text))
-    r.appendChild(t)
-    p.appendChild(pPr)
-    p.appendChild(r)
-    return p
+    # Duyệt qua các thành phần của tài liệu
+    for p in doc.paragraphs:
+        txt = p.text.upper()
+        if "PHẦN 1" in txt or "PHẦN I" in txt: current_part = "P1"
+        elif "PHẦN 2" in txt or "PHẦN II" in txt: current_part = "P2"
+        elif "PHẦN 3" in txt or "PHẦN III" in txt: current_part = "P3"
+        
+        # Nhận diện điểm bắt đầu của một câu hỏi mới
+        if re.match(r'^Câu\s*\d+', p.text, re.IGNORECASE):
+            if current_question:
+                # Lưu câu hỏi cũ vào kho
+                diff = get_question_difficulty(current_question[0].text)
+                sections[prev_part].append({"content": current_question, "diff": diff})
+            current_question = [p]
+            prev_part = current_part
+        elif current_question:
+            current_question.append(p)
+            
+    # Lưu câu hỏi cuối cùng
+    if current_question:
+        diff = get_question_difficulty(current_question[0].text)
+        sections[prev_part].append({"content": current_question, "diff": diff})
+        
+    return sections
 
-# ==================== GIAO DIỆN CHÍNH ====================
-st.title("🧩 Trích xuất & Gộp Đề Chuẩn Cấu Trúc")
+# ==================== GIAO DIỆN ====================
+st.title("🧩 Gộp Đề Tổng Hợp (Fix Lỗi Content)")
 
-files = st.file_uploader("Tải các file chủ đề (.docx)", type="docx", accept_multiple_files=True)
+uploaded_files = st.file_uploader("Tải các file chủ đề (.docx)", type="docx", accept_multiple_files=True)
 
-if files:
+if uploaded_files:
     if 'bank' not in st.session_state:
-        st.session_state.bank = {f.name: parse_docx(f.read()) for f in files}
+        st.session_state.bank = {}
+        for f in uploaded_files:
+            doc = Document(io.BytesIO(f.read()))
+            st.session_state.bank[f.name] = split_into_parts(doc)
 
+    st.subheader("Cấu hình số câu lấy từ mỗi chủ đề")
     configs = {}
-    st.write("### 1. Chọn số lượng câu hỏi từ mỗi file")
-    cols = st.columns(len(files))
+    cols = st.columns(len(uploaded_files))
     for i, fname in enumerate(st.session_state.bank.keys()):
         with cols[i]:
-            st.info(f"📂 {fname}")
-            p1 = st.number_input(f"P1 (Câu)", 0, 20, 0, key=f"n1_{fname}")
-            p2 = st.number_input(f"P2 (Câu)", 0, 10, 0, key=f"n2_{fname}")
-            p3 = st.number_input(f"P3 (Câu)", 0, 10, 0, key=f"n3_{fname}")
+            st.info(f"📁 {fname}")
+            p1 = st.number_input(f"P1", 0, 50, 0, key=f"p1_{fname}")
+            p2 = st.number_input(f"P2", 0, 50, 0, key=f"p2_{fname}")
+            p3 = st.number_input(f"P3", 0, 50, 0, key=f"p3_{fname}")
             configs[fname] = {"P1": p1, "P2": p2, "P3": p3}
 
-    if st.button("🚀 XUẤT ĐỀ THI TỔNG HỢP", type="primary", use_container_width=True):
-        final_selected = {"P1": [], "P2": [], "P3": []}
-        for fname, cfg in configs.items():
-            for p in ["P1", "P2", "P3"]:
-                pool = []
-                for d in ["NB", "TH", "VD", "VDC"]:
-                    pool.extend(st.session_state.bank[fname][p][d])
-                if len(pool) >= cfg[p] and cfg[p] > 0:
-                    final_selected[p].extend(random.sample(pool, cfg[p]))
-                elif len(pool) < cfg[p]:
-                    st.warning(f"File {fname} không đủ câu cho {p}, đã lấy tối đa {len(pool)} câu.")
-                    final_selected[p].extend(pool)
-
-        output = io.BytesIO()
-        with zipfile.ZipFile(io.BytesIO(files[0].getvalue()), 'r') as zin:
-            with zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED) as zout:
-                for item in zin.infolist():
-                    if item.filename == "word/document.xml":
-                        doc_dom = minidom.parseString(zin.read(item.filename).decode('utf-8'))
-                        body = doc_dom.getElementsByTagNameNS(W_NS, "body")[0]
-                        
-                        # Giữ lại sectPr (lề trang, khổ giấy)
-                        sectPr = body.getElementsByTagNameNS(W_NS, "sectPr")[-1]
-                        
-                        # Xóa nội dung cũ
-                        for child in list(body.childNodes):
-                            if child != sectPr: body.removeChild(child)
-                        
-                        titles = {
-                            "P1": "PHẦN I. Câu trắc nghiệm nhiều phương án lựa chọn.",
-                            "P2": "PHẦN II. Câu trắc nghiệm đúng sai.",
-                            "P3": "PHẦN III. Câu trắc nghiệm trả lời ngắn."
-                        }
-                        
-                        for p in ["P1", "P2", "P3"]:
-                            if final_selected[p]:
-                                # Chèn tiêu đề phần
-                                body.insertBefore(create_heading_paragraph(titles[p], doc_dom), sectPr)
-                                random.shuffle(final_selected[p])
-                                
-                                for idx, q_blocks in enumerate(final_selected[p]):
-                                    for block in q_blocks:
-                                        # Quan trọng: Import node vào document mới
-                                        imported_block = doc_dom.importNode(block, True)
-                                        
-                                        # Đánh lại số câu tại block đầu tiên
-                                        if block == q_blocks[0]:
-                                            t_nodes = imported_block.getElementsByTagNameNS(W_NS, "t")
-                                            for t in t_nodes:
-                                                if t.firstChild and "Câu" in t.firstChild.nodeValue:
-                                                    t.firstChild.nodeValue = re.sub(r'Câu\s*\d+', f"Câu {idx+1}", t.firstChild.nodeValue)
-                                                    t.firstChild.nodeValue = re.sub(r'#(NB|TH|VD|VDC)', '', t.firstChild.nodeValue)
-                                                    break
-                                        body.insertBefore(imported_block, sectPr)
-                        
-                        zout.writestr(item, doc_dom.toxml().encode('utf-8'))
-                    else:
-                        zout.writestr(item, zin.read(item.filename))
+    if st.button("🚀 TẠO ĐỀ THI TỔNG HỢP", type="primary", use_container_width=True):
+        final_doc = Document() # Tạo file mới
+        composer = Composer(final_doc)
         
-        st.success("✅ Đã xử lý xong! Vui lòng tải file bên dưới.")
-        st.download_button("📥 Tải đề chuẩn cấu trúc", output.getvalue(), "De_Thi_Chuan_Cau_Truc.docx")
+        titles = {
+            "P1": "PHẦN I. Câu trắc nghiệm nhiều phương án lựa chọn.",
+            "P2": "PHẦN II. Câu trắc nghiệm đúng sai.",
+            "P3": "PHẦN III. Câu trắc nghiệm trả lời ngắn."
+        }
+
+        for part_key in ["P1", "P2", "P3"]:
+            # Lấy danh sách câu hỏi được chọn
+            selected_questions = []
+            for fname, cfg in configs.items():
+                num_needed = cfg[part_key]
+                pool = []
+                for diff in ["NB", "TH", "VD", "VDC"]:
+                    pool.extend(st.session_state.bank[fname][part_key][diff])
+                
+                if len(pool) >= num_needed:
+                    selected_questions.extend(random.sample(pool, num_needed))
+                else:
+                    selected_questions.extend(pool)
+
+            if selected_questions:
+                # 1. Thêm tiêu đề phần
+                p_title = final_doc.add_paragraph()
+                run = p_title.add_run(titles[part_key])
+                run.bold = True
+                
+                # 2. Trộn thứ tự câu hỏi trong phần
+                random.shuffle(selected_questions)
+                
+                # 3. Chèn nội dung và đánh lại số câu
+                for idx, q_data in enumerate(selected_questions):
+                    for i, para in enumerate(q_data["content"]):
+                        new_p = final_doc.add_paragraph()
+                        # Đánh lại số câu tại dòng đầu tiên
+                        text = para.text
+                        if i == 0:
+                            text = re.sub(r'^Câu\s*\d+', f"Câu {idx+1}", text, flags=re.IGNORECASE)
+                            text = re.sub(r'#(NB|TH|VD|VDC)', '', text)
+                        
+                        new_p.text = text
+                        # Copy định dạng (đơn giản)
+                        new_p.style = para.style
+
+        # Xuất file
+        output = io.BytesIO()
+        final_doc.save(output)
+        st.success("🎉 Đề thi đã được tạo thành công và không còn lỗi cấu trúc!")
+        st.download_button("📥 Tải đề thi tổng hợp", output.getvalue(), "De_Tong_Hop_Final.docx")
