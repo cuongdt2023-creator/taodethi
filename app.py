@@ -11,12 +11,12 @@ st.set_page_config(page_title="AIOMT - Fix Lỗi Gộp Đề", page_icon="🛠�
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 
 def get_text(block):
-    """Lấy văn bản thô từ một block XML để nhận diện tiêu đề/câu hỏi."""
+    """Lấy văn bản thô từ một block XML."""
     texts = [t.firstChild.nodeValue for t in block.getElementsByTagNameNS(W_NS, "t") if t.firstChild]
     return "".join(texts).strip()
 
 def detect_difficulty(text):
-    """Nhận diện độ khó từ các tag #NB, #TH...."""
+    """Nhận diện độ khó từ các tag #NB, #TH..."""
     t = text.upper()
     for tag in ["#VDC", "#VD", "#TH", "#NB"]:
         if tag in t: return tag[1:]
@@ -54,7 +54,6 @@ def create_heading_paragraph(text, dom):
     """Tạo Paragraph XML chuẩn cho tiêu đề để tránh lỗi cấu trúc Word."""
     p = dom.createElementNS(W_NS, "w:p")
     pPr = dom.createElementNS(W_NS, "w:pPr")
-    # Định dạng in đậm và cỡ chữ cho tiêu đề Phần
     rPr = dom.createElementNS(W_NS, "w:rPr")
     b = dom.createElementNS(W_NS, "w:b")
     rPr.appendChild(b)
@@ -78,10 +77,11 @@ if files:
         st.session_state.bank = {f.name: parse_docx(f.read()) for f in files}
 
     configs = {}
+    st.write("### 1. Chọn số lượng câu hỏi từ mỗi file")
     cols = st.columns(len(files))
     for i, fname in enumerate(st.session_state.bank.keys()):
         with cols[i]:
-            st.info(f"📁 {fname}")
+            st.info(f"📂 {fname}")
             p1 = st.number_input(f"P1 (Câu)", 0, 20, 0, key=f"n1_{fname}")
             p2 = st.number_input(f"P2 (Câu)", 0, 10, 0, key=f"n2_{fname}")
             p3 = st.number_input(f"P3 (Câu)", 0, 10, 0, key=f"n3_{fname}")
@@ -96,21 +96,24 @@ if files:
                     pool.extend(st.session_state.bank[fname][p][d])
                 if len(pool) >= cfg[p] and cfg[p] > 0:
                     final_selected[p].extend(random.sample(pool, cfg[p]))
+                elif len(pool) < cfg[p]:
+                    st.warning(f"File {fname} không đủ câu cho {p}, đã lấy tối đa {len(pool)} câu.")
+                    final_selected[p].extend(pool)
 
         output = io.BytesIO()
-        # Sử dụng file đầu tiên làm mẫu để lấy các khai báo namespace chuẩn
         with zipfile.ZipFile(io.BytesIO(files[0].getvalue()), 'r') as zin:
             with zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED) as zout:
                 for item in zin.infolist():
                     if item.filename == "word/document.xml":
                         doc_dom = minidom.parseString(zin.read(item.filename).decode('utf-8'))
                         body = doc_dom.getElementsByTagNameNS(W_NS, "body")[0]
-                        # Xóa nội dung cũ để xây dựng lại từ đầu
-                        for child in list(body.childNodes):
-                            if child.nodeType == 1 and child.localName != "sectPr":
-                                body.removeChild(child)
                         
+                        # Giữ lại sectPr (lề trang, khổ giấy)
                         sectPr = body.getElementsByTagNameNS(W_NS, "sectPr")[-1]
+                        
+                        # Xóa nội dung cũ
+                        for child in list(body.childNodes):
+                            if child != sectPr: body.removeChild(child)
                         
                         titles = {
                             "P1": "PHẦN I. Câu trắc nghiệm nhiều phương án lựa chọn.",
@@ -120,12 +123,16 @@ if files:
                         
                         for p in ["P1", "P2", "P3"]:
                             if final_selected[p]:
+                                # Chèn tiêu đề phần
                                 body.insertBefore(create_heading_paragraph(titles[p], doc_dom), sectPr)
+                                random.shuffle(final_selected[p])
+                                
                                 for idx, q_blocks in enumerate(final_selected[p]):
-                                    # Cập nhật số câu và xóa tag
                                     for block in q_blocks:
-                                        # Import block từ file gốc vào tài liệu mới để tránh lỗi sở hữu node
+                                        # Quan trọng: Import node vào document mới
                                         imported_block = doc_dom.importNode(block, True)
+                                        
+                                        # Đánh lại số câu tại block đầu tiên
                                         if block == q_blocks[0]:
                                             t_nodes = imported_block.getElementsByTagNameNS(W_NS, "t")
                                             for t in t_nodes:
@@ -139,4 +146,5 @@ if files:
                     else:
                         zout.writestr(item, zin.read(item.filename))
         
-        st.download_button("📥 Tải đề đã sửa lỗi", output.getvalue(), "De_Thi_Chuan.docx")
+        st.success("✅ Đã xử lý xong! Vui lòng tải file bên dưới.")
+        st.download_button("📥 Tải đề chuẩn cấu trúc", output.getvalue(), "De_Thi_Chuan_Cau_Truc.docx")
