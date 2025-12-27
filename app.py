@@ -5,18 +5,20 @@ import re
 from docx import Document
 from docxcompose.composer import Composer
 
-# Kỹ thuật "Cắt tỉa": Nhân bản file gốc rồi xóa phần thừa để giữ 100% công thức
+# Hàm quan trọng nhất: Trích xuất câu hỏi giữ nguyên MathType/Ảnh
 def extract_safe(source_bytes, start_idx, end_idx):
     doc = Document(io.BytesIO(source_bytes))
     total = len(doc.paragraphs)
+    # Xóa ngược từ dưới lên để giữ nguyên cấu trúc các dòng còn lại
     for i in range(total - 1, -1, -1):
         if not (start_idx <= i < end_idx):
             p = doc.paragraphs[i]._element
             p.getparent().remove(p)
     return doc
 
-def analyze_structure(file_bytes):
+def analyze_file(file_bytes):
     doc = Document(io.BytesIO(file_bytes))
+    # Phân loại theo 3 phần chuẩn của bạn
     mapping = {"P1": [], "P2": [], "P3": []}
     current_part = "P1"
     q_start = -1
@@ -31,47 +33,48 @@ def analyze_structure(file_bytes):
     if q_start != -1: mapping[last_part].append((q_start, len(doc.paragraphs)))
     return mapping
 
-st.set_page_config(page_title="Tạo Đề Tổng Hợp", layout="wide")
-st.title("🚀 Tạo Đề Mới (Bảo Toàn MathType/Hình Ảnh)")
+st.title("🛡️ Tạo Đề Thi - Bảo Toàn MathType")
 
-files = st.file_uploader("Tải các file ngân hàng câu hỏi", type="docx", accept_multiple_files=True)
+files = st.file_uploader("Chọn các file ngân hàng (.docx)", type="docx", accept_multiple_files=True)
 
 if files:
-    db = {f.name: {"bytes": f.read(), "map": analyze_structure(f.getvalue())} for f in files}
-    st.info("Chọn số lượng câu hỏi từ mỗi file nguồn:")
+    db = {f.name: {"bytes": f.read(), "map": analyze_file(f.getvalue())} for f in files}
+    st.info("Nhập số câu cần lấy từ mỗi file:")
     
     selected_config = {}
     for fname in db:
-        with st.expander(f"📁 {fname}"):
+        with st.expander(f"📁 File: {fname}"):
             c1, c2, c3 = st.columns(3)
             p1 = c1.number_input("Phần I", 0, 50, 0, key=f"p1_{fname}")
             p2 = c2.number_input("Phần II", 0, 50, 0, key=f"p2_{fname}")
             p3 = c3.number_input("Phần III", 0, 50, 0, key=f"p3_{fname}")
             selected_config[fname] = {"P1": p1, "P2": p2, "P3": p3}
 
-    if st.button("🌟 XUẤT ĐỀ THI TỔNG HỢP", type="primary"):
-        # Tạo file Master (lấy định dạng từ file đầu tiên)
+    if st.button("🚀 XUẤT ĐỀ THI TỔNG HỢP"):
+        # Lấy file đầu tiên làm mẫu định dạng (Header/Footer/Font)
         master_doc = Document(io.BytesIO(list(db.values())[0]["bytes"]))
         for p in master_doc.paragraphs: master_doc._element.body.remove(p._element)
         
         composer = Composer(master_doc)
         global_q = 1
         
+        # Duyệt qua từng phần để đảm bảo thứ tự I -> II -> III
         for p_key, p_label in [("P1", "PHẦN I"), ("P2", "PHẦN II"), ("P3", "PHẦN III")]:
             master_doc.add_paragraph(f"{p_label}.").bold = True
             for fname, cfg in selected_config.items():
                 if cfg[p_key] > 0:
                     chosen = random.sample(db[fname]["map"][p_key], cfg[p_key])
                     for start, end in chosen:
-                        q_doc = extract_safe(db[fname]["bytes"], start, end)
-                        # Đổi số câu mà không làm hỏng MathType
-                        for p in q_doc.paragraphs:
+                        # Trích xuất "nguyên khối" để không bao giờ mất hệ phương trình
+                        sub_doc = extract_safe(db[fname]["bytes"], start, end)
+                        # Đánh lại số câu chuẩn
+                        for p in sub_doc.paragraphs:
                             if re.match(r'^Câu\s*\d+', p.text, re.I):
                                 p.text = re.sub(r'^Câu\s*\d+', f"Câu {global_q}", p.text, flags=re.I)
                                 global_q += 1; break
-                        composer.append(q_doc)
+                        composer.append(sub_doc)
         
         out = io.BytesIO()
         master_doc.save(out)
-        st.success("Đã tạo đề thành công! Hệ phương trình và ảnh được giữ nguyên.")
-        st.download_button("📥 Tải đề thi", out.getvalue(), "De_Thi_Tong_Hop.docx")
+        st.success("✅ Đề thi đã được tạo với đầy đủ hệ phương trình và hình ảnh!")
+        st.download_button("📥 Tải về file kết quả", out.getvalue(), "De_Thi_Chuan.docx")
