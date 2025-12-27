@@ -5,83 +5,87 @@ import re
 from docx import Document
 from docxcompose.composer import Composer
 
-# Hàm cốt lõi để bảo toàn MathType và Hình ảnh
-def get_cleaned_question_doc(file_bytes, start_idx, end_idx):
-    """
-    Tạo một bản sao của file gốc và xóa mọi thứ trừ đoạn từ start_idx đến end_idx.
-    """
-    doc = Document(io.BytesIO(file_bytes))
-    paragraphs = doc.paragraphs
-    total = len(paragraphs)
-    
-    # Xóa từ dưới lên để không làm thay đổi chỉ số (index) của các đoạn phía trên
-    for i in range(total - 1, -1, -1):
+# Hàm cắt lấy 1 đoạn nội dung từ file gốc mà không làm hỏng MathType/Ảnh
+def extract_section_safe(source_bytes, start_idx, end_idx):
+    doc = Document(io.BytesIO(source_bytes))
+    # Xóa tất cả các đoạn văn không nằm trong khoảng cần lấy
+    for i in range(len(doc.paragraphs) - 1, -1, -1):
         if not (start_idx <= i < end_idx):
-            p = paragraphs[i]._element
+            p = doc.paragraphs[i]._element
             p.getparent().remove(p)
-            
     return doc
 
-def main():
-    st.title("🛡️ Trộn Đề Bảo Toàn Tuyệt Đối MathType & Hình Vẽ")
-    st.info("Phương pháp: Cắt tỉa trực tiếp trên file gốc để giữ nguyên 100% định dạng.")
-
-    uploaded_file = st.file_uploader("Tải lên file đề (.docx)", type="docx")
-
-    if uploaded_file:
-        file_bytes = uploaded_file.read()
-        doc = Document(io.BytesIO(file_bytes))
+def analyze_file(file_bytes):
+    doc = Document(io.BytesIO(file_bytes))
+    questions = {"P1": [], "P2": [], "P3": []}
+    current_part = "P1"
+    start_idx = -1
+    
+    for i, p in enumerate(doc.paragraphs):
+        txt = p.text.strip().upper()
+        if "PHẦN 1" in txt or "PHẦN I" in txt: current_part = "P1"
+        elif "PHẦN 2" in txt or "PHẦN II" in txt: current_part = "P2"
+        elif "PHẦN 3" in txt or "PHẦN III" in txt: current_part = "P3"
         
-        # Nhận diện vị trí các câu hỏi
-        q_map = []
-        current_start = -1
-        
-        for i, p in enumerate(doc.paragraphs):
-            # Nhận diện "Câu 1.", "Câu 2."...
-            if re.match(r'^Câu\s*\d+', p.text.strip(), re.IGNORECASE):
-                if current_start != -1:
-                    q_map.append((current_start, i))
-                current_start = i
-        
-        if current_start != -1:
-            q_map.append((current_start, len(doc.paragraphs)))
-
-        st.success(f"Tìm thấy {len(q_map)} câu hỏi.")
-        
-        num_versions = st.number_input("Số lượng mã đề:", 1, 20, 4)
-
-        if st.button("🚀 Bắt đầu trộn đề"):
-            # Tạo file Master để gộp (lấy định dạng từ file gốc)
-            master_output = Document(io.BytesIO(file_bytes))
-            for p in master_output.paragraphs:
-                p._element.getparent().remove(p._element)
+        if re.match(r'^Câu\s*\d+', p.text, re.I):
+            if start_idx != -1:
+                questions[prev_part].append((start_idx, i))
+            start_idx = i
+            prev_part = current_part
             
-            composer = Composer(master_output)
+    if start_idx != -1:
+        questions[prev_part].append((start_idx, len(doc.paragraphs)))
+    return questions
+
+# --- GIAO DIỆN ---
+st.title("🚀 Tạo Đề Thi Tổng Hợp (Bảo toàn MathType)")
+
+files = st.file_uploader("Tải các file ngân hàng câu hỏi (.docx)", type="docx", accept_multiple_files=True)
+
+if files:
+    all_data = {}
+    for f in files:
+        b = f.read()
+        all_data[f.name] = {"bytes": b, "struct": analyze_file(b)}
+    
+    st.subheader("Cấu hình số câu cần lấy:")
+    selected_config = {}
+    for fname, data in all_data.items():
+        with st.expander(f"File: {fname}"):
+            c1, c2, c3 = st.columns(3)
+            q1 = c1.number_input(f"Phần 1 (Max {len(data['struct']['P1'])})", 0, len(data['struct']['P1']), 0, key=f"n1_{fname}")
+            q2 = c2.number_input(f"Phần 2 (Max {len(data['struct']['P2'])})", 0, len(data['struct']['P2']), 0, key=f"n2_{fname}")
+            q3 = c3.number_input(f"Phần 3 (Max {len(data['struct']['P3'])})", 0, len(data['struct']['P3']), 0, key=f"n3_{fname}")
+            selected_config[fname] = {"P1": q1, "P2": q2, "P3": q3}
+
+    if st.button("Tạo Đề Mới"):
+        # Tạo file tổng (Master)
+        master_doc = Document(io.BytesIO(list(all_data.values())[0]["bytes"]))
+        for p in master_doc.paragraphs: master_doc._element.body.remove(p._element)
+        composer = Composer(master_doc)
+        
+        current_q_num = 1
+        for part in ["P1", "P2", "P3"]:
+            # Thêm tiêu đề phần
+            master_doc.add_paragraph(f"--- {part} ---").bold = True
             
-            # Trộn thứ tự
-            shuffled_indices = list(range(len(q_map)))
-            random.shuffle(shuffled_indices)
-
-            with st.spinner("Đang xử lý bảo toàn dữ liệu..."):
-                for new_idx, old_idx in enumerate(shuffled_indices):
-                    start, end = q_map[old_idx]
-                    
-                    # CẮT TỈA: Lấy file chứa duy nhất câu hỏi này từ file gốc
-                    temp_doc = get_cleaned_question_doc(file_bytes, start, end)
-                    
-                    # Đánh lại số câu (vẫn giữ định dạng)
-                    for p in temp_doc.paragraphs:
-                        if re.match(r'^Câu\s*\d+', p.text.strip(), re.IGNORECASE):
-                            p.text = re.sub(r'^Câu\s*\d+', f"Câu {new_idx + 1}", p.text, flags=re.IGNORECASE)
-                            break
-                    
-                    # GỘP AN TOÀN bằng docxcompose
-                    composer.append(temp_doc)
-
-            # Xuất file
-            out_io = io.BytesIO()
-            master_output.save(out_io)
-            st.download_button("📥 Tải đề đã trộn", out_io.getvalue(), "De_Thi_Bao_Toan.docx")
-
-if __name__ == "__main__":
-    main()
+            for fname, cfg in selected_config.items():
+                num_to_take = cfg[part]
+                if num_to_take > 0:
+                    indices = random.sample(all_data[fname]["struct"][part], num_to_take)
+                    for start, end in indices:
+                        # Trích xuất "nguyên khối" để giữ MathType/Ảnh
+                        q_doc = extract_section_safe(all_data[fname]["bytes"], start, end)
+                        
+                        # Đánh lại số câu
+                        for p in q_doc.paragraphs:
+                            if re.match(r'^Câu\s*\d+', p.text, re.I):
+                                p.text = re.sub(r'^Câu\s*\d+', f"Câu {current_q_num}", p.text, flags=re.I)
+                                current_q_num += 1
+                                break
+                        composer.append(q_doc)
+        
+        out = io.BytesIO()
+        master_doc.save(out)
+        st.success("Đã tạo đề thành công!")
+        st.download_button("Tải Đề Tổng Hợp", out.getvalue(), "De_Tong_Hop.docx")
