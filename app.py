@@ -2,24 +2,23 @@ import streamlit as st
 import io
 import random
 import re
-import copy
 from docx import Document
 from docxcompose.composer import Composer
+from copy import deepcopy
 
-# ==================== CẤU HÌNH TRANG ====================
-st.set_page_config(page_title="Pro Exam Gen - MathType & Image Safe", page_icon="🛡️", layout="wide")
+# ==================== CẤU HÌNH ====================
+st.set_page_config(page_title="Trộn Đề Word: Bảo Toàn Tuyệt Đối", page_icon="💎", layout="wide")
 
 st.markdown("""
 <style>
-    .main-header { text-align: center; color: #0066cc; font-weight: bold; }
-    .status-box { padding: 10px; border-radius: 5px; border: 1px solid #ddd; background-color: #f9f9f9; }
+    .main-header { text-align: center; color: #b91c1c; font-weight: bold; }
+    .info-box { background-color: #fef2f2; border: 1px solid #fecaca; padding: 10px; border-radius: 5px; }
 </style>
 """, unsafe_allow_html=True)
 
-# ==================== LOGIC XỬ LÝ WORD PRO ====================
+# ==================== LOGIC XỬ LÝ WORD (THUẬT TOÁN TRIM) ====================
 
-def get_difficulty_from_text(text):
-    """Phát hiện độ khó từ text, mặc định là NB"""
+def get_difficulty(text):
     t = text.upper()
     if "#VDC" in t: return "VDC"
     if "#VD" in t: return "VD"
@@ -27,139 +26,131 @@ def get_difficulty_from_text(text):
     if "#NB" in t: return "NB"
     return "NB"
 
-def clean_tags(doc):
-    """Xóa các tag #NB, #TH... sau khi đã xử lý xong"""
-    for p in doc.paragraphs:
-        if "#" in p.text:
-            for tag in ["#NB", "#TH", "#VD", "#VDC"]:
-                if tag in p.text:
-                    # Thay thế text đơn giản (có thể cải tiến để giữ format run)
-                    p.text = p.text.replace(tag, "")
-
-def extract_questions_safe(file_bytes, file_name):
+def analyze_document_structure(file_bytes):
     """
-    Thuật toán Clone & Prune:
-    Thay vì copy câu hỏi ra, ta nhân bản file gốc và xóa những phần thừa.
-    Đảm bảo 100% giữ nguyên MathType và Hình ảnh.
+    Quét file để tìm tọa độ (index) của các câu hỏi và phần đáp án.
+    Không chỉnh sửa file ở bước này.
     """
-    # 1. Quét lần đầu để xác định vị trí (index) của các câu hỏi
-    doc_map = Document(io.BytesIO(file_bytes))
-    question_ranges = [] # Lưu trữ [(start_index, end_index, difficulty, part)]
+    doc = Document(io.BytesIO(file_bytes))
+    map_data = {
+        "questions": [], # List of dict: {start_idx, end_idx, diff, part}
+        "footer_start": -1, # Vị trí bắt đầu phần đáp án/hướng dẫn
+        "p1_idx": -1, "p2_idx": -1, "p3_idx": -1
+    }
     
     current_part = "P1"
-    start_idx = -1
+    q_start = -1
     
-    # Duyệt qua các paragraph để tìm tọa độ
-    for i, p in enumerate(doc_map.paragraphs):
+    total_paras = len(doc.paragraphs)
+    
+    for i, p in enumerate(doc.paragraphs):
         txt = p.text.strip().upper()
         
-        # Nhận diện phần
+        # 1. Nhận diện phần
         if txt.startswith("PHẦN 1") or txt.startswith("PHẦN I"): current_part = "P1"
         elif txt.startswith("PHẦN 2") or txt.startswith("PHẦN II"): current_part = "P2"
         elif txt.startswith("PHẦN 3") or txt.startswith("PHẦN III"): current_part = "P3"
         
-        # Nhận diện câu hỏi
+        # 2. Nhận diện Bảng đáp án / Hướng dẫn (thường ở cuối)
+        # Nếu gặp từ khóa này, coi như hết phần câu hỏi
+        if "BẢNG ĐÁP ÁN" in txt or "HƯỚNG DẪN GIẢI" in txt or "LỜI GIẢI" in txt:
+            if q_start != -1:
+                 # Lưu câu hỏi cuối cùng trước khi vào phần đáp án
+                diff = get_difficulty(doc.paragraphs[q_start].text)
+                map_data["questions"].append({"range": (q_start, i), "diff": diff, "part": prev_part})
+                q_start = -1
+            map_data["footer_start"] = i
+            break 
+
+        # 3. Nhận diện Câu hỏi
         if re.match(r'^Câu\s*\d+', p.text, re.IGNORECASE):
-            if start_idx != -1:
+            if q_start != -1:
                 # Lưu câu hỏi trước đó
-                diff = get_difficulty_from_text(doc_map.paragraphs[start_idx].text)
-                question_ranges.append({
-                    "range": (start_idx, i), # Từ dòng start đến dòng hiện tại
-                    "diff": diff,
-                    "part": prev_part_marker
-                })
+                diff = get_difficulty(doc.paragraphs[q_start].text)
+                map_data["questions"].append({"range": (q_start, i), "diff": diff, "part": prev_part})
             
-            start_idx = i
-            prev_part_marker = current_part
+            q_start = i
+            prev_part = current_part
             
-    # Lưu câu cuối cùng
-    if start_idx != -1:
-        diff = get_difficulty_from_text(doc_map.paragraphs[start_idx].text)
-        question_ranges.append({
-            "range": (start_idx, len(doc_map.paragraphs)),
-            "diff": diff,
-            "part": prev_part_marker
-        })
-
-    # 2. Xử lý trích xuất (Phần nặng nhất)
-    # Để tối ưu, ta không clone ngay mà chỉ lưu metadata.
-    # Khi nào user bấm "Tạo đề" mới thực hiện cắt file để tiết kiệm RAM.
+    # Lưu câu hỏi cuối cùng nếu chưa gặp footer
+    if q_start != -1 and map_data["footer_start"] == -1:
+        diff = get_difficulty(doc.paragraphs[q_start].text)
+        map_data["questions"].append({"range": (q_start, total_paras), "diff": diff, "part": prev_part})
     
-    return {
-        "file_bytes": file_bytes, # Lưu lại bytes gốc để clone sau này
-        "ranges": question_ranges,
-        "filename": file_name
-    }
+    return map_data
 
-def create_sub_doc(file_bytes, start, end):
-    """Tạo một file docx nhỏ chỉ chứa 1 câu hỏi từ file gốc"""
-    # Load file gốc
+def extract_content_by_trimming(file_bytes, keep_ranges):
+    """
+    Cốt lõi của phương pháp Triệt Để:
+    Load file gốc -> Xóa TẤT CẢ các đoạn KHÔNG nằm trong keep_ranges -> Trả về Doc.
+    keep_ranges: List các tuple (start, end) cần giữ lại.
+    """
     doc = Document(io.BytesIO(file_bytes))
     
-    # Xóa các paragraph KHÔNG nằm trong range [start, end]
-    # Lưu ý: Xóa từ dưới lên trên để không làm lệch index
+    # Tạo danh sách các index cần xóa (ngược lại với cần giữ)
+    # Tư duy: Giữ lại những dòng user chọn, còn lại xóa hết.
     
-    total = len(doc.paragraphs)
-    # Xóa phần đuôi (từ end đến hết)
-    for i in range(total - 1, end - 1, -1):
-        p = doc.paragraphs[i]
-        p._element.getparent().remove(p._element)
-        
-    # Xóa phần đầu (từ start-1 về 0)
-    for i in range(start - 1, -1, -1):
-        p = doc.paragraphs[i]
-        p._element.getparent().remove(p._element)
-        
+    total_paras = len(doc.paragraphs)
+    indices_to_keep = set()
+    for start, end in keep_ranges:
+        for i in range(start, end):
+            indices_to_keep.add(i)
+            
+    # Xóa từ dưới lên trên để không làm lệch index
+    for i in range(total_paras - 1, -1, -1):
+        if i not in indices_to_keep:
+            p = doc.paragraphs[i]
+            # Xóa paragraph khỏi XML
+            p._element.getparent().remove(p._element)
+            
     return doc
 
 # ==================== GIAO DIỆN CHÍNH ====================
 
-st.markdown("<h1 class='main-header'>🛡️ Hệ thống Trộn Đề PRO (Bảo toàn MathType)</h1>", unsafe_allow_html=True)
-st.write("Giải pháp xử lý xung đột XML & ID hình ảnh triệt để.")
+st.markdown("<h1 class='main-header'>💎 Tạo Đề Chuẩn (Giữ Đáp Án & MathType)</h1>", unsafe_allow_html=True)
+st.markdown("<div class='info-box'>⚠️ <b>Lưu ý quan trọng:</b> Chương trình sẽ tự động tìm phần <b>'BẢNG ĐÁP ÁN'</b> hoặc <b>'HƯỚNG DẪN GIẢI'</b> ở cuối mỗi file để gộp vào đề tổng hợp. Hãy đảm bảo file gốc có các mục này nếu bạn muốn giữ lại đáp án.</div>", unsafe_allow_html=True)
 
-uploaded_files = st.file_uploader("Bước 1: Tải file Ngân hàng câu hỏi", type="docx", accept_multiple_files=True)
+files = st.file_uploader("Bước 1: Tải các file chủ đề", type="docx", accept_multiple_files=True)
 
-if uploaded_files:
-    # Phân tích file (Chỉ quét vị trí, chưa cắt file để nhanh)
-    if 'bank_meta' not in st.session_state or len(st.session_state.bank_meta) != len(uploaded_files):
-        with st.spinner("Đang quét cấu trúc file... (Giữ nguyên MathType)"):
-            st.session_state.bank_meta = {}
-            for f in uploaded_files:
+if files:
+    # Phân tích cấu trúc (Metadata)
+    if 'structs' not in st.session_state or len(st.session_state.structs) != len(files):
+        with st.spinner("Đang quét cấu trúc file..."):
+            st.session_state.structs = {}
+            for f in files:
                 f_bytes = f.read()
-                st.session_state.bank_meta[f.name] = extract_questions_safe(f_bytes, f.name)
-    
-    st.success(f"Đã tải xong {len(uploaded_files)} file. Sẵn sàng cấu hình.")
+                st.session_state.structs[f.name] = {
+                    "bytes": f_bytes,
+                    "meta": analyze_document_structure(f_bytes)
+                }
 
-    # Giao diện cấu hình ma trận
-    st.subheader("Bước 2: Cấu hình Ma trận đề thi")
-    
+    st.subheader("Bước 2: Cấu hình số câu")
     configs = {}
-    cols = st.columns(len(uploaded_files))
+    cols = st.columns(len(files))
     
-    for i, (fname, meta) in enumerate(st.session_state.bank_meta.items()):
-        # Đếm số lượng câu hiện có để user biết
+    for i, fname in enumerate(st.session_state.structs.keys()):
+        meta = st.session_state.structs[fname]["meta"]
+        qs = meta["questions"]
         counts = {"P1": 0, "P2": 0, "P3": 0}
-        for q in meta["ranges"]:
-            counts[q["part"]] += 1
-            
-        with cols[i]:
-            st.info(f"📂 {fname[:15]}...\n\n(Tổng: {len(meta['ranges'])} câu)")
-            p1 = st.number_input(f"P1 (Có {counts['P1']})", 0, 50, 0, key=f"p1_{fname}")
-            p2 = st.number_input(f"P2 (Có {counts['P2']})", 0, 50, 0, key=f"p2_{fname}")
-            p3 = st.number_input(f"P3 (Có {counts['P3']})", 0, 50, 0, key=f"p3_{fname}")
-            configs[fname] = {"P1": p1, "P2": p2, "P3": p3}
-
-    if st.button("🚀 BẮT ĐẦU TRỘN ĐỀ (PRO MODE)", type="primary", use_container_width=True):
-        progress_bar = st.progress(0)
-        status_text = st.empty()
+        for q in qs: counts[q["part"]] += 1
         
+        has_footer = "✅ Có Đáp án" if meta["footer_start"] != -1 else "⚠️ Không thấy Đáp án"
+        
+        with cols[i]:
+            st.info(f"📄 {fname[:15]}\n\n({has_footer})")
+            configs[fname] = {
+                "P1": st.number_input(f"P1 (Max {counts['P1']})", 0, 50, 0, key=f"p1_{fname}"),
+                "P2": st.number_input(f"P2 (Max {counts['P2']})", 0, 50, 0, key=f"p2_{fname}"),
+                "P3": st.number_input(f"P3 (Max {counts['P3']})", 0, 50, 0, key=f"p3_{fname}")
+            }
+
+    if st.button("🚀 XUẤT ĐỀ THI HOÀN CHỈNH", type="primary", use_container_width=True):
+        status = st.empty()
         try:
-            # 1. Tạo file đích (Master) từ file đầu tiên để lấy Lề/Khổ giấy chuẩn
-            first_file_bytes = list(st.session_state.bank_meta.values())[0]["file_bytes"]
-            master_doc = Document(io.BytesIO(first_file_bytes))
-            # Xóa sạch nội dung Master, chỉ giữ lại Section Properties
-            for p in master_doc.paragraphs:
-                p._element.getparent().remove(p._element)
+            # 1. Tạo Master Doc từ file đầu tiên (Xóa sạch nội dung, giữ định dạng)
+            base_bytes = list(st.session_state.structs.values())[0]["bytes"]
+            master_doc = Document(io.BytesIO(base_bytes))
+            for p in master_doc.paragraphs: p._element.getparent().remove(p._element)
             
             composer = Composer(master_doc)
             
@@ -169,61 +160,73 @@ if uploaded_files:
                 "P3": "PHẦN III. Câu trắc nghiệm trả lời ngắn."
             }
             
-            parts = ["P1", "P2", "P3"]
-            total_steps = len(parts)
+            # --- XỬ LÝ GỘP CÂU HỎI ---
+            global_q_idx = {"P1": 1, "P2": 1, "P3": 1}
             
-            for step_idx, p_key in enumerate(parts):
-                status_text.write(f"⏳ Đang xử lý {titles[p_key]}...")
+            for p_key in ["P1", "P2", "P3"]:
+                status.write(f"⏳ Đang xử lý {titles[p_key]}...")
                 
-                # Gom danh sách các câu hỏi cần lấy (Metadata)
-                selected_meta_questions = [] # List các dict {file_bytes, range}
+                # Gom tất cả request cho phần này
+                part_requests = [] # List of {fname, q_data}
                 
                 for fname, cfg in configs.items():
-                    meta = st.session_state.bank_meta[fname]
-                    # Lọc câu hỏi thuộc phần này
-                    pool = [q for q in meta["ranges"] if q["part"] == p_key]
-                    
-                    num_take = min(cfg[p_key], len(pool))
-                    if num_take > 0:
-                        chosen = random.sample(pool, num_take)
-                        for q in chosen:
-                            selected_meta_questions.append({
-                                "file_bytes": meta["file_bytes"],
-                                "range": q["range"],
-                                "diff": q["diff"]
-                            })
+                    data = st.session_state.structs[fname]
+                    pool = [q for q in data["meta"]["questions"] if q["part"] == p_key]
+                    num = min(cfg[p_key], len(pool))
+                    if num > 0:
+                        selected = random.sample(pool, num)
+                        for q in selected:
+                            part_requests.append({"fname": fname, "q": q, "bytes": data["bytes"]})
                 
-                if selected_meta_questions:
-                    # Thêm tiêu đề phần
+                if part_requests:
+                    # Thêm tiêu đề phần vào Master
                     master_doc.add_paragraph(titles[p_key]).bold = True
+                    random.shuffle(part_requests)
                     
-                    random.shuffle(selected_meta_questions)
-                    
-                    # Bắt đầu cắt file và gộp (Đây là bước tốn thời gian nhất nhưng an toàn nhất)
-                    for idx, item in enumerate(selected_meta_questions):
-                        # Nhân bản và cắt tỉa
-                        sub_doc = create_sub_doc(item["file_bytes"], item["range"][0], item["range"][1])
+                    for req in part_requests:
+                        # TRICK: Mở file gốc -> Xóa hết trừ câu hỏi này -> Append vào Master
+                        # Cách này giữ 100% MathType/Ảnh của câu hỏi đó
+                        q_range = req["q"]["range"]
+                        q_doc = extract_content_by_trimming(req["bytes"], [q_range])
                         
-                        # Đánh số lại
-                        first_p = sub_doc.paragraphs[0]
-                        first_p.text = re.sub(r'^Câu\s*\d+', f"Câu {idx+1}", first_p.text, flags=re.IGNORECASE)
+                        # Đánh lại số câu
+                        # Vì q_doc đã bị trim, câu hỏi chắc chắn nằm ở đoạn đầu
+                        for p in q_doc.paragraphs:
+                            if re.match(r'^Câu\s*\d+', p.text, re.IGNORECASE):
+                                p.text = re.sub(r'^Câu\s*\d+', f"Câu {global_q_idx[p_key]}", p.text, flags=re.IGNORECASE)
+                                p.text = re.sub(r'#(NB|TH|VD|VDC)', '', p.text)
+                                break
                         
-                        # Làm sạch thẻ #NB...
-                        clean_tags(sub_doc)
-                        
-                        # Gộp vào Master
-                        composer.append(sub_doc)
+                        global_q_idx[p_key] += 1
+                        composer.append(q_doc)
+
+            # --- XỬ LÝ GỘP ĐÁP ÁN (FOOTER) ---
+            status.write("⏳ Đang tổng hợp Đáp án & Hướng dẫn giải...")
+            master_doc.add_page_break()
+            master_doc.add_paragraph("--- TỔNG HỢP ĐÁP ÁN & HƯỚNG DẪN ---").bold = True
+            
+            for fname in configs.keys():
+                data = st.session_state.structs[fname]
+                footer_start = data["meta"]["footer_start"]
                 
-                progress_bar.progress((step_idx + 1) / total_steps)
+                # Nếu file này có phần đáp án và chúng ta có lấy câu hỏi từ file này
+                total_picked = sum(configs[fname].values())
+                if footer_start != -1 and total_picked > 0:
+                    master_doc.add_paragraph(f"Nguồn: {fname}").italic = True
+                    
+                    # Cắt lấy phần đuôi từ footer_start đến hết
+                    total_len = len(Document(io.BytesIO(data["bytes"])).paragraphs)
+                    footer_doc = extract_content_by_trimming(data["bytes"], [(footer_start, total_len)])
+                    composer.append(footer_doc)
+                    master_doc.add_paragraph("-" * 20)
 
             # Xuất file
-            status_text.write("💾 Đang lưu file cuối cùng...")
-            output = io.BytesIO()
-            master_doc.save(output)
+            out = io.BytesIO()
+            master_doc.save(out)
             
-            st.success("✅ Thành công tuyệt đối! File an toàn 100%.")
-            st.download_button("📥 Tải đề thi PRO (.docx)", output.getvalue(), "De_Thi_Pro_Safe.docx")
+            status.empty()
+            st.success("✅ Xử lý hoàn tất! Cấu trúc, Công thức và Đáp án đã được bảo toàn.")
+            st.download_button("📥 Tải đề thi (.docx)", out.getvalue(), "De_Thi_Tiet_Kiem_Format.docx")
             
         except Exception as e:
-            st.error(f"Có lỗi xảy ra: {str(e)}")
-            st.write("Chi tiết lỗi:", e)
+            st.error(f"Lỗi hệ thống: {str(e)}")
