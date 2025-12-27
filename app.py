@@ -5,90 +5,95 @@ import re
 from docx import Document
 from docxcompose.composer import Composer
 
-# ==================== CẤU HÌNH GIAO DIỆN ====================
-st.set_page_config(page_title="AIOMT Premium - Gộp Đề Chuẩn", page_icon="🎯", layout="wide")
+# Cấu hình giao diện
+st.set_page_config(page_title="AIOMT - Bảo Toàn Công Thức & Hình Ảnh", layout="wide")
 
-st.markdown("""
-<style>
-    .main-header { text-align: center; color: #0d9488; }
-    .file-box { border: 1px solid #e2e8f0; padding: 10px; border-radius: 8px; background: #f8fafc; margin-bottom: 10px; }
-</style>
-""", unsafe_allow_html=True)
+def get_difficulty(para_text):
+    t = para_text.upper()
+    for tag in ["#VDC", "#VD", "#TH", "#NB"]:
+        if tag in t: return tag[1:]
+    return "NB"
 
-# ==================== LOGIC XỬ LÝ CHUYÊN SÂU ====================
-
-def split_docx_into_questions(file_bytes):
+def split_docx_to_questions(file_bytes):
     """
-    Tách file gốc thành từng file Document nhỏ cho mỗi câu hỏi.
-    Cách này giúp Composer giữ được toàn bộ Media (hình, công thức).
+    Tách file gốc thành từng câu hỏi. 
+    Mỗi câu hỏi được lưu tạm dưới dạng một đối tượng Document riêng để bảo toàn Media.
     """
-    source_stream = io.BytesIO(file_bytes)
-    source_doc = Document(source_stream)
+    source_doc = Document(io.BytesIO(file_bytes))
     bank = {"P1": [], "P2": [], "P3": []}
     
     current_part = "P1"
-    # Dùng để chứa các câu hỏi tạm thời dưới dạng Document riêng biệt
-    temp_elements = []
-    
+    questions_data = []
+    temp_paras = []
+
     for p in source_doc.paragraphs:
         txt = p.text.upper()
-        # Chuyển phần khi gặp từ khóa
         if "PHẦN 1" in txt or "PHẦN I" in txt: current_part = "P1"
         elif "PHẦN 2" in txt or "PHẦN II" in txt: current_part = "P2"
         elif "PHẦN 3" in txt or "PHẦN III" in txt: current_part = "P3"
 
-        # Nếu gặp chữ "Câu", bắt đầu một file Document mới cho câu đó
         if re.match(r'^Câu\s*\d+', p.text, re.IGNORECASE):
-            if temp_elements:
-                # Gói các đoạn văn trước đó thành 1 file Word ảo
-                q_doc = Document(io.BytesIO(file_bytes)) # Copy toàn bộ template gốc
-                for para in q_doc.paragraphs: # Xóa sạch chỉ để lại khung
-                    para._element.getparent().remove(para._element)
+            if temp_paras:
+                # Tạo một document nhỏ chứa duy nhất câu hỏi này để giữ nguyên hình/ảnh
+                q_doc = Document(io.BytesIO(file_bytes)) 
+                # Xóa sạch mọi thứ trong q_doc, chỉ để lại các đoạn văn của câu hỏi này
+                target_body = q_doc._element.body
+                for child in list(target_body):
+                    if child.tag.endswith('sectPr'): continue
+                    target_body.remove(child)
                 
-                # Thêm nội dung câu hỏi vào file ảo này
-                for elem in temp_elements:
-                    new_p = q_doc.add_paragraph()
-                    new_p._element.getparent().replace(new_p._element, elem._element)
+                for para in temp_paras:
+                    target_body.append(para._element)
                 
-                bank[current_part_at_start].append(q_doc)
+                diff = get_difficulty(temp_paras[0].text)
+                bank[start_part].append({"doc": q_doc, "diff": diff})
             
-            temp_elements = [p]
-            current_part_at_start = current_part
-        elif temp_elements:
-            temp_elements.append(p)
+            temp_paras = [p]
+            start_part = current_part
+        elif temp_paras:
+            temp_paras.append(p)
+
+    # Lưu câu cuối
+    if temp_paras:
+        q_doc = Document(io.BytesIO(file_bytes))
+        target_body = q_doc._element.body
+        for child in list(target_body):
+            if child.tag.endswith('sectPr'): continue
+            target_body.remove(child)
+        for para in temp_paras: target_body.append(para._element)
+        bank[start_part].append({"doc": q_doc, "diff": get_difficulty(temp_paras[0].text)})
 
     return bank
 
-# ==================== GIAO DIỆN CHÍNH ====================
+st.title("🎯 Tạo Đề Tổng Hợp: Giữ Nguyên Hình Ảnh & Công Thức")
 
-st.markdown("<h1 class='main-header'>🎯 Hệ Thống Gộp Đề Bảo Toàn Hình Ảnh & Công Thức</h1>", unsafe_allow_html=True)
+uploaded_files = st.file_uploader("Tải các file chủ đề (.docx)", type="docx", accept_multiple_files=True)
 
-files = st.file_uploader("1. Tải các file đề chủ đề (.docx)", type="docx", accept_multiple_files=True)
+if uploaded_files:
+    if 'bank' not in st.session_state:
+        st.session_state.bank = {f.name: split_docx_to_questions(f.read()) for f in uploaded_files}
 
-if files:
-    if 'bank' not in st.session_state or len(st.session_state.bank) != len(files):
-        with st.spinner("Đang trích xuất dữ liệu thông minh..."):
-            st.session_state.bank = {f.name: split_docx_into_questions(f.read()) for f in files}
-
+    st.subheader("Chọn số lượng câu hỏi từ mỗi file")
     configs = {}
-    st.subheader("2. Thiết lập số câu")
-    cols = st.columns(len(files))
+    cols = st.columns(len(uploaded_files))
     for i, fname in enumerate(st.session_state.bank.keys()):
         with cols[i]:
-            st.markdown(f"<div class='file-box'>📂 <b>{fname[:15]}...</b></div>", unsafe_allow_html=True)
-            configs[fname] = {
-                "P1": st.number_input(f"P1 (Câu)", 0, 50, 0, key=f"p1_{fname}"),
-                "P2": st.number_input(f"P2 (Câu)", 0, 50, 0, key=f"p2_{fname}"),
-                "P3": st.number_input(f"P3 (Câu)", 0, 50, 0, key=f"p3_{fname}")
-            }
+            st.info(f"📁 {fname}")
+            p1 = st.number_input(f"P1", 0, 50, 0, key=f"p1_{fname}")
+            p2 = st.number_input(f"P2", 0, 50, 0, key=f"p2_{fname}")
+            p3 = st.number_input(f"P3", 0, 50, 0, key=f"p3_{fname}")
+            configs[fname] = {"P1": p1, "P2": p2, "P3": p3}
 
-    if st.button("🚀 XUẤT ĐỀ THI TỔNG HỢP CHUẨN", type="primary", use_container_width=True):
-        # Tạo file đích giữ nguyên Section Properties (lề trang) của file đầu tiên
-        final_doc = Document(io.BytesIO(files[0].getvalue()))
-        for p in final_doc.paragraphs:
-            final_doc._element.body.remove(p._element)
+    if st.button("🚀 XUẤT ĐỀ THI TỔNG HỢP", type="primary", use_container_width=True):
+        # 1. Lấy file đầu tiên làm mẫu (Template) để giữ Margin, Font, Header/Footer
+        main_doc = Document(io.BytesIO(uploaded_files[0].getvalue()))
+        # Xóa sạch nội dung cũ trong body nhưng giữ lại sectPr (định dạng trang)
+        body = main_doc._element.body
+        for child in list(body):
+            if not child.tag.endswith('sectPr'):
+                body.remove(child)
         
-        composer = Composer(final_doc)
+        composer = Composer(main_doc)
         
         titles = {
             "P1": "PHẦN I. Câu trắc nghiệm nhiều phương án lựa chọn.",
@@ -97,32 +102,32 @@ if files:
         }
 
         for p_key in ["P1", "P2", "P3"]:
-            selected_docs = []
+            selected = []
             for fname, cfg in configs.items():
                 pool = st.session_state.bank[fname][p_key]
                 num = min(cfg[p_key], len(pool))
-                if num > 0:
-                    selected_docs.extend(random.sample(pool, num))
+                if num > 0: selected.extend(random.sample(pool, num))
             
-            if selected_docs:
-                # Thêm tiêu đề Phần
-                t_para = final_doc.add_paragraph()
-                t_para.add_run(titles[p_key]).bold = True
-                
-                random.shuffle(selected_docs)
-                for idx, q_doc in enumerate(selected_docs):
-                    # Đánh lại số câu trực tiếp trong Document tạm
+            if selected:
+                # Thêm tiêu đề phần vào main_doc
+                title_para = main_doc.add_paragraph()
+                run = title_para.add_run(titles[p_key])
+                run.bold = True
+                run.font.size = 14 * 12700 # Size 14
+
+                random.shuffle(selected)
+                for idx, q_data in enumerate(selected):
+                    q_doc = q_data["doc"]
+                    # Đánh lại số câu trong Document tạm
                     for p in q_doc.paragraphs:
-                        if re.match(r'^Câu\s*\d+', p.text, re.IGNORECASE):
+                        if "Câu" in p.text:
                             p.text = re.sub(r'^Câu\s*\d+', f"Câu {idx+1}", p.text, flags=re.IGNORECASE)
+                            p.text = re.sub(r'#(NB|TH|VD|VDC)', '', p.text)
                             break
-                    
-                    # Gộp file
+                    # Dùng composer để gộp - Đây là bước giữ lại hình ảnh/công thức
                     composer.append(q_doc)
 
-        out_io = io.BytesIO()
-        final_doc.save(out_io)
-        st.success("✅ Đề thi đã sẵn sàng!")
-        st.download_button("📥 Tải đề ngay", out_io.getvalue(), "De_Tong_Hop_Chuan.docx")
-
-st.info("💡 Lưu ý: Hãy đảm bảo bạn đã thêm 'docxcompose' và 'python-docx' vào file requirements.txt.")
+        output = io.BytesIO()
+        main_doc.save(output)
+        st.success("✅ Đã tạo đề thành công! Hình ảnh và công thức đã được bảo toàn.")
+        st.download_button("📥 Tải đề chuẩn (.docx)", output.getvalue(), "De_Tong_Hop_Bao_Toan.docx")
